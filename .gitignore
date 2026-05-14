@@ -1,0 +1,8 @@
+ToDo.txt
+engine.cp310-win_amd64.pyd
+model_backups/
+.vs/
+__pycache__/
+build/
+
+profiler.py
