@@ -68,7 +68,6 @@ python setup.py build_ext --inplace
 ```
 
 This creates 2 .pyd files, `engine.pyd` which is what we want, and another file with a very long name. This needs to be in the project root and built on all machines (it's a compiled C++ extension)
----
 
 ## Checkpoints
 
@@ -77,11 +76,9 @@ This creates 2 .pyd files, `engine.pyd` which is what we want, and another file 
 - `best_model.pth`: when a new highest avg lines when evaluated
 
 If you stopped training, using `load_full_checkpoint('checkpoint.pth')` will load all context when it was last saved (last 50 iterations)
----
 
 ## Timeouts
 all client timeouts have been setto 1800 seconds (30 min). When an eval machine stops responding the server will just skip it and continue evaluating on the rest of the machines.
----
 
 ## Prerequisites
 - pytorch
