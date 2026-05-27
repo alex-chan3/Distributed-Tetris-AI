@@ -4,6 +4,10 @@ import torch.optim as optim
 import random
 import numpy as np
 from collections import deque
+import socket
+import io
+import struct
+import threading
 
 import engine
 
@@ -17,6 +21,63 @@ ITERATIONS = 5000
 BATCH_SIZE = 256
 BUFFER_SIZE = 100000
 TARGET_UPDATE = 100
+EVAL_SERVER_PORT = 9000 # ensure this matches with eval_server.py or else it will not work
+
+def load_server_address(path = 'server.txt'):
+    with open(path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                return line
+    raise ValueError(f"No valid address in {path}")
+
+# this collects evaluation results without blocking this training program
+# each result is (avg_lines_cleared, iteration)
+_eval_result_queue = []
+_eval_result_lock = threading.Lock()
+
+def _eval_worker(payload, iteration):
+    """
+    This runs in the background and sends it to the evaluation server and waits for the results,
+    without blocking training allowing for training to continue. Results are stored in the queue
+    """
+    host = load_server_address()
+    print(f"Evaluation Thread started, sending weights to {host}:{EVAL_SERVER_PORT} (iteration {iteration})")
+    try:
+        with socket.create_connection((host, EVAL_SERVER_PORT), timeout = 1800) as sock: # timeout is 30 minutes as evaluating takes a long time
+            sock.sendall(struct.pack('>I', len(payload)))
+            sock.sendall(payload)
+
+            # blocking part to wait for results from server (thread only)
+            result = _recv_exactly(sock, 8)
+            if result is None:
+                print(f"Server did not respond (iteration {iteration})")
+                return
+            avg_lines, _ = struct.unpack('>ff', result)
+            avg_lines = float(avg_lines)
+            print(f"\n Result received for iteration {iteration}: avg = {avg_lines:.2f}")
+
+            with _eval_result_lock:
+                _eval_result_queue.append((avg_lines, iteration))
+    except (ConnectionRefusedError, OSError) as e:
+        print(f"Connection to server for iteration {iteration} has failed: {e}")
+
+def send_weights_async(num_games = 30, iteration = 0):
+    buf = io.BytesIO()
+    torch.save({'model': model.state_dict(), 'num_games': num_games}, buf)
+    payload = buf.getvalue()
+
+    t = threading.Thread(target=_eval_worker, args = (payload, iteration), daemon = True)
+    t.start()
+
+def _recv_exactly(sock, n):
+    data = b''
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
 
 def save_checkpoint(path = 'checkpoint.pth'):
     torch.save({
@@ -25,15 +86,14 @@ def save_checkpoint(path = 'checkpoint.pth'):
         'optimizer': optimizer.state_dict(),
         'epsilon': EPSILON
     }, path)
-    print(f"Model saved at {path}")
+    print(f"Model saved to {path}")
 
 def load_weights_only(path = 'checkpoint.pth'):
     checkpoint = torch.load(path)
     model.load_state_dict(checkpoint['model'])
     target_model.load_state_dict(checkpoint['target_model'])
-    print(f"Model weights loaded from {path}")
+    print(f"Model loaded from {path}")
 
-# unlike load_weights_only, this can be used to continue training
 def load_full_checkpoint(path = 'checkpoint.pth'):
     global EPSILON
     checkpoint = torch.load(path)
@@ -41,24 +101,19 @@ def load_full_checkpoint(path = 'checkpoint.pth'):
     target_model.load_state_dict(checkpoint['target_model'])
     optimizer.load_state_dict(checkpoint['optimizer'])
     EPSILON = checkpoint['epsilon']
-    print(f"Loaded everything from {path}")
+    print(f"Loaded everything in {path}")
 
-# use to make features between 0 and 1
 def normalize_states(states):
     states = states[:, :23]
-
     states = states.clone()
-
-    # from the engine, state is: [lines, col0 height, ..., col9 height, col0 holes, ..., col9 holes, total smoothness, max height]
-
-    states[:, 0] /= 4.0        # lines cleared: 0-4
-    states[:, 1:11] /= 20.0    # column heights: 0-20
-    states[:, 11:21] /= 20.0   # column holes: 0-20
-    states[:, 21] /= 100.0     # smoothness: 0-100
-    states[:, 22] /= 20.0      # max height: 0-20
+    # from the engine: [lines, col0, ..., col9 heights, col0,..., col9 holes, smoothness, max_height]
+    states[:, 0] /= 4.0
+    states[:, 1:11] /= 20.0
+    states[:, 11:21] /= 20.0
+    states[:, 21] /= 100.0
+    states[:, 22] /= 20.0
     return states
 
-# ml network definition
 class TetrisModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -69,24 +124,21 @@ class TetrisModel(nn.Module):
             nn.ReLU(),
             nn.Linear(32, 1)
         )
-
+    
     def forward(self, x):
         return self.net(x)
 
-# allows for epsilon-greedy exploration
 def selectMove(states, epsilon):
     if random.random() < epsilon:
         return random.randrange(len(states))
-    
     with torch.no_grad():
         q_vals = model(states).squeeze(-1)
-    return torch.argmax(q_vals).item()
+    return torch.argmax(q_vals).item()    
 
-# update weights/teaching model
 def trainStep():
     if len(replay_buffer) < BATCH_SIZE:
         return
-    
+
     batch = random.sample(replay_buffer, BATCH_SIZE)
 
     states = torch.stack([b[0] for b in batch])
@@ -103,67 +155,29 @@ def trainStep():
             if ns is None:
                 continue
             q_vals = target_model(ns).squeeze(-1)
-            next_q[i] =torch.max(q_vals)
+            next_q[i] = torch.max(q_vals)
     
     targets = rewards + GAMMA * next_q * (1 - dones)
 
     loss = nn.MSELoss()(preds, targets)
-
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-# used to evaluate models to find/compare them
-def evaluate(model, env, num_games=10):
-    global EPSILON
-    saved_epsilon = EPSILON
-    EPSILON = 0.0
-
-    results = []
-
-    for i in range(num_games):
-        env.initialize(1)
-        moves = 0
-
-        raw = env.getNextStep()
-        states = normalize_states(torch.tensor(raw, dtype = torch.float32))
-
-        while not env.gameLost():
-            with torch.no_grad():
-                q_vals = model(states).squeeze(-1)
-            move = torch.argmax(q_vals).item()
-
-            env.applyMove(move)
-
-            if not env.gameLost():
-                raw = env.getNextStep()
-                states = normalize_states(torch.tensor(raw, dtype = torch.float32))
-            
-            moves += 1
-        
-        lines = env.getLinesCleared()
-        results.append(lines)
-        print(f"  Eval Game {i + 1:2d} | Lines Cleared: {lines:5d} | Pieces Dropped: {moves:5d}")
-    
-    EPSILON = saved_epsilon
-
-    avg = np.mean(results)
-    cv = (np.std(results) / avg * 100) if avg > 0 else 0.0
-
-    print(f"  Average: {avg:.4f} | CV: {cv:.4f}%")
-    return avg, cv
-
-# main training method
 def train(env, iterations):
     global EPSILON
-    curr_avg_lines = 0
     max_avg_lines = 0
-    curr_cv = 0
-    max_cv = 0
 
     for it in range(iterations):
+        with _eval_result_lock:
+            while _eval_result_queue:
+                avg_lines, from_iter = _eval_result_queue.pop(0)
+                if avg_lines > max_avg_lines:
+                    max_avg_lines = avg_lines
+                    save_checkpoint('best_model.pth')
+                    print(f"New best model saved (avg = {avg_lines:.2f} from iteration {from_iter})")
+        
         env.initialize(1)
-
         total_score = 0
         moves = 0
 
@@ -184,13 +198,8 @@ def train(env, iterations):
             else:
                 raw_next = env.getNextStep()
                 next_states = normalize_states(torch.tensor(raw_next, dtype = torch.float32))
-
-            replay_buffer.append((
-                chosen_state,
-                reward,
-                next_states,
-                float(done)
-            ))
+            
+            replay_buffer.append((chosen_state, reward, next_states, float(done)))
 
             trainStep()
 
@@ -198,34 +207,26 @@ def train(env, iterations):
                 states = next_states
             
             moves += 1
-        
-        EPSILON = max(EPSILON_MIN, EPSILON * EPSILON_DECAY)
+        EPSILON = max (EPSILON_MIN, EPSILON * EPSILON_DECAY)
 
         if it % TARGET_UPDATE == 0:
             target_model.load_state_dict(model.state_dict())
-            print("--- target model updated ---")
-
+            print("---- target model updated ----")
+        
         lines = env.getLinesCleared()
-
         print(
             f"Iteration {it:4d} | "
             f"Score {total_score:8.2f} | "
             f"Lines {lines:4d} | "
             f"Moves {moves:4d} | "
             f"Eps {EPSILON:.3f} | "
-            f"Max Average Lines: {max_avg_lines:8.1f} | "
-            f"Max model's cv: {max_cv:6.1f}"
+            f"Max Avg Lines: {max_avg_lines:8.1f}"
         )
 
         if it % 100 == 0 and it != 0:
-            print("Evaluating now")
+            print("Sending model to evaluator server")
             save_checkpoint('model_to_evaluate.pth')
-            curr_avg_lines, curr_cv = evaluate(model, env, 30)
-
-            if curr_avg_lines > max_avg_lines:
-                save_checkpoint('best_model.pth')
-                max_avg_lines = curr_avg_lines
-                max_cv = curr_cv
+            send_weights_async(num_games = 30, iteration = it)
         
         if it % 50 == 0:
             save_checkpoint('checkpoint.pth')
@@ -236,7 +237,7 @@ target_model.load_state_dict(model.state_dict())
 target_model.eval()
 
 optimizer = optim.Adam(model.parameters(), lr = LR)
-replay_buffer = deque(maxlen=BUFFER_SIZE)
+replay_buffer = deque(maxlen = BUFFER_SIZE)
 
 if __name__ == '__main__':
     env = engine.Engine()
