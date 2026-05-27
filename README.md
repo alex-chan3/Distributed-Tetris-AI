@@ -58,7 +58,7 @@ python eval_server.py
 python machine_learning_model.py
 ```
 
-Order matters, you must start eval_server.py before running machine_learning_model, and eval_client.py before eval_server.py sends the first weights out.
+> **Note:** Order matters, you must start eval_server.py before running machine_learning_model, and eval_client.py before eval_server.py sends the first weights out.
 ---
 
 ## Building the engine
